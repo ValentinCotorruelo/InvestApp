@@ -6,6 +6,11 @@ from .walk_forward import (
     WalkForwardRunner,
     WalkForwardSummary,
 )
+from .walk_forward_engine import (
+    AssetWalkForwardResult,
+    run_walk_forward,
+    summary_table,
+)
 
 __all__ = [
     "BacktestEngine",
@@ -17,4 +22,7 @@ __all__ = [
     "WalkForwardResult",
     "WalkForwardRunner",
     "WalkForwardSummary",
+    "AssetWalkForwardResult",
+    "run_walk_forward",
+    "summary_table",
 ]

@@ -91,6 +91,7 @@ class Trade:
     return_pct: float
     reason: str = ""
     hold_bars: int = 0
+    status: str = "closed"  # "closed" | "open" (valuada al cierre del último día)
 
     def to_dict(self) -> dict:
         return {
@@ -103,6 +104,7 @@ class Trade:
             "return_pct": self.return_pct,
             "reason": self.reason,
             "hold_bars": self.hold_bars,
+            "status": self.status,
         }
 
 
@@ -192,6 +194,8 @@ class BacktestEngine:
         fee_rate: float = 0.001,  # 0.1% por operación (ida y vuelta)
         fill: str = "open",  # "open" | "close": donde ejecutar señales extremas
     ):
+        if fill not in ("open", "close", "next_open"):
+            raise ValueError(f"fill inválido: {fill!r} (usá 'open', 'close' o 'next_open').")
         self.initial_capital = initial_capital
         self.sizing = sizing or PositionSizingParams()
         self.fee_rate = fee_rate
@@ -246,6 +250,7 @@ class BacktestEngine:
                 )
 
         closes = df["Close"].to_numpy()
+        opens = df["Open"].to_numpy()
         highs = df["High"].to_numpy()
         lows = df["Low"].to_numpy()
         atr_arr = df["ATR"].fillna(0.0).to_numpy()
@@ -255,6 +260,7 @@ class BacktestEngine:
         cash = self.initial_capital
         shares = 0
         entry_price = 0.0
+        last_entry_price = 0.0
         entry_date = None
         stop_loss = 0.0
         take_profit: float | None = None
@@ -264,24 +270,142 @@ class BacktestEngine:
         hold_bars = 0
         last_stop_date_offset = -10**9  # cooldown
 
+        # Órdenes pendientes para el modo "next_open" (señal en t, ejecución en t+1)
+        pending_buy_reason = ""
+        pending_sell_reason = ""
+
         equity = pd.Series(index=index, dtype=float)
         trades: list[Trade] = []
         events: list[dict] = []
         decisions: list[DayDecision] = []
 
+        def _open_position(i, fill_price, sig) -> bool:
+            """Abre una posición long. Devuelve True si se abrió."""
+            nonlocal shares, cash, entry_date, stop_loss, take_profit, trailing
+            nonlocal trailing_mult, hold_bars, entry_index, last_entry_price, entry_price
+            if sig is None or sig.entry <= 0 or sig.stop_loss <= 0:
+                return False
+            if sig.stop_loss >= fill_price:
+                return False
+            shares_calc, notional, _ = compute_position_size(
+                cash, fill_price, sig.stop_loss, self.sizing
+            )
+            if shares_calc <= 0:
+                return False
+            cost = shares_calc * fill_price
+            fees = cost * self.fee_rate
+            if cost + fees > cash:
+                return False
+            shares = shares_calc
+            cash -= cost + fees
+            entry_date = date
+            entry_price = fill_price
+            last_entry_price = fill_price
+            stop_loss = sig.stop_loss
+            take_profit = sig.take_profit
+            if take_profit is not None and take_profit <= fill_price:
+                take_profit = None
+            trailing_mult = (
+                sig.meta.get("trailing_mult", risk.trailing_atr_multiplier)
+                or risk.trailing_atr_multiplier
+            )
+            trailing = fill_price - (
+                float(atr_arr[i]) * trailing_mult if float(atr_arr[i]) > 0 else 0.0
+            )
+            entry_index = i
+            hold_bars = 0
+            events.append(
+                {
+                    "date": date,
+                    "type": "entry",
+                    "price": fill_price,
+                    "strength": sig.strength,
+                    "reasons": sig.reasons,
+                }
+            )
+            return True
+
+        def _close_position(exit_price, reason, i):
+            """Cierra la posición abierta."""
+            nonlocal shares, cash, entry_price, stop_loss, take_profit, trailing, hold_bars
+            proceeds = exit_price * shares
+            fees = proceeds * self.fee_rate
+            cash += proceeds - fees
+            pnl = (exit_price - entry_price) * shares
+            trades.append(
+                Trade(
+                    entry_date=entry_date,
+                    entry_price=entry_price,
+                    exit_date=date,
+                    exit_price=exit_price,
+                    shares=shares,
+                    pnl=pnl,
+                    return_pct=(exit_price / entry_price - 1) if entry_price else 0.0,
+                    reason=reason,
+                    hold_bars=hold_bars,
+                )
+            )
+            events.append(
+                {"date": date, "type": "exit", "price": exit_price, "reason": reason}
+            )
+            if reason == "stop_loss":
+                nonlocal last_stop_date_offset
+                last_stop_date_offset = i
+            shares = 0
+            entry_price = 0.0
+            stop_loss = 0.0
+            take_profit = None
+            trailing = None
+            hold_bars = 0
+
+        # Variable de llenado pendiente (modo "next_open"): señal de compra/venta
+        # generada en el día t que se ejecuta al OPEN de t+1.
+        use_next_open = self.fill == "next_open"
+        pending_buy_signal = None
+        pending_sell = False
+
+        entered_today = False
+        exited_today = False
+
         for i in range(n):
             date = index[i]
             close = float(closes[i])
-
-            # Una sola evaluación de la estrategia por día
-            ev = strategy.evaluate(i)
+            low = float(lows[i])
+            high = float(highs[i])
             in_test = i >= warmup_idx
-            exited_today = False
             entered_today = False
+            exited_today = False
 
-            # Snapshot para el registro día a día (se captura antes de mutar estado)
+            # ---- 1) Ejecutar órdenes pendientes del día anterior (next_open) ----
+            if use_next_open:
+                open_i = float(opens[i])
+
+                # Venta pendiente por señal de estrategia → cerrar al open
+                if pending_sell and shares > 0:
+                    if in_test:
+                        _close_position(open_i, "señal_salida", i)
+                        exited_today = True
+                    else:
+                        shares = 0  # fuera de ventana: no se registra
+                    pending_sell = False
+
+                # Compra pendiente por señal → abrir al open
+                if pending_buy_signal is not None:
+                    sig = pending_buy_signal
+                    pending_buy_signal = None
+                    if (
+                        shares == 0
+                        and in_test
+                        and (i - last_stop_date_offset) >= cooldown
+                    ):
+                        if _open_position(i, open_i, sig):
+                            entered_today = True
+
+            # ---- 2) Evaluar la estrategia del día (usando datos hasta t) ----
+            ev = strategy.evaluate(i)
+
+            # Snapshot para el registro día a día
             if in_test:
-                levels = strategy.exit_levels_at(i) if (shares > 0 or ev.signal is not None) else None
                 decision = DayDecision(
                     date=date,
                     price=close,
@@ -299,66 +423,42 @@ class BacktestEngine:
                     indicators=dict(ev.indicators),
                 )
 
-            # ---- EXIT: primero cerrar posiciones ----
+            # ---- 3) Gestión de la posición vigente (stops/takes intrabarra) ----
+            exit_reason_today = ""
             if shares > 0:
-                exit_price: float | None = None
-                reason = ""
-                low = float(lows[i])
-                high = float(highs[i])
-
                 if low <= stop_loss:
-                    exit_price = stop_loss
-                    reason = "stop_loss"
+                    exit_reason_today = "stop_loss"
                 elif take_profit is not None and high >= take_profit:
-                    exit_price = take_profit
-                    reason = "take_profit"
+                    exit_reason_today = "take_profit"
                 elif trailing is not None and low <= trailing:
-                    exit_price = trailing
-                    reason = "trailing_stop"
-                else:
-                    # Señal de salida de la estrategia
-                    if ev.should_exit:
-                        exit_price = close
-                        reason = "; ".join(ev.context.get("exit_reasons", [])) or "señal_salida"
+                    exit_reason_today = "trailing_stop"
 
-                # Solo cerramos posiciones abiertas en la ventana de operación
-                if in_test and exit_price is not None:
-                    proceeds = exit_price * shares
-                    fees = proceeds * self.fee_rate
-                    cash += proceeds - fees
-                    pnl = (exit_price - entry_price) * shares
-                    trades.append(
-                        Trade(
-                            entry_date=entry_date,
-                            entry_price=entry_price,
-                            exit_date=date,
-                            exit_price=exit_price,
-                            shares=shares,
-                            pnl=pnl,
-                            return_pct=(exit_price / entry_price - 1) if entry_price else 0.0,
-                            reason=reason,
-                            hold_bars=hold_bars,
-                        )
+                if not use_next_open and exit_reason_today == "" and ev.should_exit:
+                    # Señal de salida ejecutada al cierre del mismo día (modos open/close)
+                    exit_reason_today = (
+                        "; ".join(ev.context.get("exit_reasons", [])) or "señal_salida"
                     )
-                    events.append(
-                        {
-                            "date": date,
-                            "type": "exit",
-                            "price": exit_price,
-                            "reason": reason,
-                        }
-                    )
-                    if reason == "stop_loss":
-                        last_stop_date_offset = i
-                    shares = 0
-                    entry_price = 0.0
-                    stop_loss = 0.0
-                    take_profit = None
-                    trailing = None
-                    hold_bars = 0
-                    exited_today = True
 
-            # ---- UPDATE trailing (aún en posición) ----
+                # En next_open, las señales de salida NO se ejecutan intrabarra:
+                # pasan a ser orden pendiente para el open siguiente. Solo stops/takes
+                # intrabarra se resuelven acá.
+                if exit_reason_today:
+                    exit_price = {
+                        "stop_loss": stop_loss,
+                        "take_profit": take_profit,
+                        "trailing_stop": trailing,
+                    }.get(
+                        exit_reason_today,
+                        close if not use_next_open else None,
+                    )
+                    if exit_price is not None and in_test:
+                        _close_position(exit_price, exit_reason_today, i)
+                    elif exit_price is not None:
+                        shares = 0
+                elif use_next_open and ev.should_exit and shares > 0:
+                    pending_sell = True
+
+            # ---- 4) UPDATE trailing (aún en posición) ----
             if shares > 0 and trailing_mult is not None:
                 atr_val = float(atr_arr[i])
                 if atr_val > 0:
@@ -366,50 +466,26 @@ class BacktestEngine:
                         trailing, close, atr_val, trailing_mult
                     )
 
-            # ---- ENTRY (no el mismo día de una salida; solo en ventana de operación) ----
-            if (
-                shares == 0
-                and in_test
-                and not exited_today
-                and (i - last_stop_date_offset) >= cooldown
-            ):
-                sig = ev.signal
-                if sig is not None and sig.entry > 0 and sig.stop_loss > 0:
-                    # Respetar R/R y stop sane
-                    if sig.stop_loss < sig.entry:
-                        entry_price = close if self.fill == "close" else sig.entry
-                        shares_calc, notional, _ = compute_position_size(
-                            cash, entry_price, sig.stop_loss, self.sizing
-                        )
-                        if shares_calc > 0:
-                            cost = shares_calc * entry_price
-                            fees = cost * self.fee_rate
-                            if cost + fees <= cash:
-                                shares = shares_calc
-                                cash -= cost + fees
-                                entry_date = date
-                                entry_price = entry_price
-                                stop_loss = sig.stop_loss
-                                take_profit = sig.take_profit
-                                if take_profit is not None and take_profit <= entry_price:
-                                    take_profit = None
-                                trailing_mult = sig.meta.get("trailing_mult", risk.trailing_atr_multiplier) or risk.trailing_atr_multiplier
-                                trailing = entry_price - (
-                                    float(atr_arr[i]) * trailing_mult
-                                    if float(atr_arr[i]) > 0 else 0.0
-                                )
-                                entry_index = i
-                                hold_bars = 0
-                                entered_today = True
-                                events.append(
-                                    {
-                                        "date": date,
-                                        "type": "entry",
-                                        "price": entry_price,
-                                        "strength": sig.strength,
-                                        "reasons": sig.reasons,
-                                    }
-                                )
+            # ---- 5) Entrada: en modos open/close se ejecuta hoy; next_open difiere ----
+            if not use_next_open:
+                if (
+                    shares == 0
+                    and in_test
+                    and (i - last_stop_date_offset) >= cooldown
+                    and ev.signal is not None
+                ):
+                    entry_px = close if self.fill == "close" else ev.signal.entry
+                    if _open_position(i, entry_px, ev.signal):
+                        entered_today = True
+            else:
+                # next_open: si hay señal de compra elegible hoy, dejar pendiente
+                # para ejecutarla al open de mañana (no acumular si ya hay señal).
+                if (
+                    pending_buy_signal is None
+                    and shares == 0
+                    and ev.signal is not None
+                ):
+                    pending_buy_signal = ev.signal
 
             if shares > 0:
                 hold_bars += 1
@@ -421,13 +497,16 @@ class BacktestEngine:
             if in_test:
                 if exited_today:
                     decision.action = "exit"
-                    decision.reason = reason
+                    decision.reason = exit_reason_today or "señal_salida"
                 elif entered_today:
                     decision.action = "entry"
-                    decision.entry_price = entry_price
+                    decision.entry_price = last_entry_price
                     decision.stop_loss = stop_loss
                     decision.take_profit = take_profit
                     decision.trailing = trailing
+                elif exit_reason_today:
+                    decision.action = "exit"
+                    decision.reason = exit_reason_today
                 decisions.append(decision)
 
         # La curva de equity y métricas cubren solo la ventana de operación
@@ -436,6 +515,33 @@ class BacktestEngine:
             df_test = df.iloc[warmup_idx:]
         else:
             df_test = df
+
+        # Posición abierta al final del período: valuarla al cierre del último
+        # día disponible y marcarla explícitamente como "open".
+        if shares > 0 and entry_date is not None:
+            open_mark = float(closes[-1])
+            trades.append(
+                Trade(
+                    entry_date=entry_date,
+                    entry_price=entry_price,
+                    exit_date=index[-1],
+                    exit_price=open_mark,
+                    shares=shares,
+                    pnl=(open_mark - entry_price) * shares,
+                    return_pct=(open_mark / entry_price - 1) if entry_price else 0.0,
+                    reason="posicion_abierta",
+                    hold_bars=hold_bars,
+                    status="open",
+                )
+            )
+            events.append(
+                {
+                    "date": index[-1],
+                    "type": "open",
+                    "price": open_mark,
+                    "reason": "posicion_abierta",
+                }
+            )
 
         return BacktestResult(
             ticker=self._ticker_name(asset),

@@ -3,6 +3,7 @@ from .trend_follower import TrendFollowerStrategy
 from .mean_reversion import MeanReversionStrategy
 from .confluence import ConfluenceStrategy
 from .hybrid import HybridStrategy
+from .support_resistance_strategy import SupportResistanceStrategy
 
 STRATEGY_REGISTRY = {
     "trend": TrendFollowerStrategy,
@@ -10,6 +11,8 @@ STRATEGY_REGISTRY = {
     "mean_reversion": MeanReversionStrategy,
     "confluence": ConfluenceStrategy,
     "hybrid": HybridStrategy,
+    "support_resistance": SupportResistanceStrategy,
+    "sr": SupportResistanceStrategy,
 }
 
 STRATEGIES = [
@@ -17,6 +20,7 @@ STRATEGIES = [
     MeanReversionStrategy.name,
     ConfluenceStrategy.name,
     HybridStrategy.name,
+    SupportResistanceStrategy.name,
 ]
 
 
@@ -39,6 +43,7 @@ __all__ = [
     "MeanReversionStrategy",
     "ConfluenceStrategy",
     "HybridStrategy",
+    "SupportResistanceStrategy",
     "get_strategy",
     "STRATEGY_REGISTRY",
     "STRATEGIES",

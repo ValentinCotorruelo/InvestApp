@@ -1,0 +1,4 @@
+﻿ticker,senal,estrategia,fecha,precio,entrada,stop_loss,take_profit,rr,strength,regime,reasons
+NVDA,VENTA,hybrid,2026-09-02,224.41000366210938,0.0,0.0,,0.0,0.0,range,Regresión a banda media completada
+PEP,VENTA,hybrid,2026-09-02,140.52000427246094,0.0,0.0,,0.0,0.0,range,Regresión a banda media completada
+XOM,VENTA,hybrid,2026-09-02,164.14999389648438,0.0,0.0,,0.0,0.0,range,"Confluencia perdida (4/9): macd_alcista, soporte_resistencia, fibonacci_zona_dorada"

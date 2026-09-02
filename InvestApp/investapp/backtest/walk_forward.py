@@ -162,6 +162,16 @@ class WalkForwardRunner:
         )
 
     def _build_strategy(self, name: str):
+        from ..strategies import (
+            ConfluenceStrategy,
+            HybridStrategy,
+            MeanReversionStrategy,
+            SupportResistanceStrategy,
+            TrendFollowerStrategy,
+        )
+
+        if name == SupportResistanceStrategy.name:
+            return SupportResistanceStrategy()
         if name == HybridStrategy.name:
             return HybridStrategy()
         if name == ConfluenceStrategy.name:

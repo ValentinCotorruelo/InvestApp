@@ -20,16 +20,16 @@ Requiere Python 3.10+.
 | `investapp.data` | Descarga y normalización de datos (`yfinance`) + gestión de lista de tickers |
 | `investapp.indicators` | RSI, MACD, ADX, ATR, EMA/SMA, Estocástico, Parabólico SAR, Bollinger, Keltner, OBV, CMF, MFI, VWAP, ROC |
 | `investapp.market_structure` | Pivotes (zigzag), Soportes/Resistencias ponderados, Retrocesos y Extensiones de Fibonacci, clasificación de tendencia |
-| `investapp.strategies` | 4 estrategias multi-indicador con puntos de compra/venta explícitos |
+| `investapp.strategies` | 5 estrategias con puntos de compra/venta explícitos (4 multi-indicador + S/R pura) |
 | `investapp.risk` | Tamaño de posición por riesgo (1%), stop-loss, take-profit, trailing, cooldowns, R/R |
 | `investapp.backtest` | Motor de backtest diario long-only + métricas (Sharpe, Sortino, drawdown, win rate) |
 | `investapp.backtest.walk_forward` | Barrido multi-activo × estrategia (2y calibración / 3y operación) + reporte HTML interactivo |
+| `investapp.backtest.walk_forward_engine` | Motor público multi-activo con ejecución al open de t+1 (`next_open`), resultado por activo y prueba anti-look-ahead |
 | `investapp.screener` | Barrido de muchas acciones y reportes CLI/HTML/CSV |
 
 ## Estrategias
 
-Las 4 estrategias combinan **muchos indicadores** y determinan puntos de
-compra/venta con reglas explícitas:
+Las estrategias determinan puntos de compra/venta con reglas explícitas:
 
 1. **Trend Follower** (`trend_follower`)
    Sigue tendencias fuertes: EMA200 alcista, ADX>25 con +DI>-DI, EMA20>EMA50
@@ -50,6 +50,12 @@ compra/venta con reglas explícitas:
 4. **Hybrid** (`hybrid`)
    Detecta el régimen de mercado y aplica la sub-estrategia adecuada:
    ADX>25 → trend follower; ADX<20 → mean reversion; 20-25 → confluence.
+
+5. **Soportes y Resistencias** (`support_resistance` / `sr`)
+   Pura, sin otros indicadores: compra por **rebote en soporte** (cierre sobre un
+   soporte tocado) o **ruptura de resistencia** (cierre con margen > 1%). Salidas
+   por pérdida del soporte o aproximación a la resistencia objetivo. Solo precio
+   y niveles. Reutilizada tal cual por el motor de walk-forward.
 
 ## Backtest
 
@@ -84,8 +90,47 @@ result.decisions_df()      # paso a paso: fecha, precio, acción, señales, modo
 
 - `warmup="2y"` → los primeros 2 años son calentamiento; compras ventas empiezan después.
 - La curva de equity y las métricas cubren solo la ventana de operación.
+- `fill="open" | "close" | "next_open"` define dónde se ejecuta la orden:
+  - `"next_open"` (recomendado): señal calculada con el cierre de `t`, orden
+    ejecutada al **open de `t+1`**. Evita el sesgo de "comprar al precio que
+    generó la señal" y es el modo por defecto del motor multi-activo.
+  - `"open"` / `"close"`: ejecuta el mismo día de la señal.
 - Sin lookahead garantizado por tests de *prefix-equivalence* (evaluar un día
   con datos hasta ese día == evaluarlo sin tener el futuro).
+
+## Motor multi-activo (walk-forward, open de t+1)
+
+Interfaz pública que corre una estrategia día a día sobre **muchos activos** y
+devuelve un resultado **por activo** (para comparar qué activos funcionan mejor).
+Consume la estrategia tal cual (no reimplementa su lógica) con `fill="next_open"`,
+una posición a la vez, comisión 0.1% por operación y tamaño de posición por riesgo
+(parametrizable):
+
+```python
+from investapp.backtest.walk_forward_engine import run_walk_forward, summary_table
+from investapp.strategies import SupportResistanceStrategy
+
+results = run_walk_forward(
+    activos=["AAPL", "SPY", "NVDA", "KO", "BA"],
+    fecha_inicio="2021-01-04",
+    fecha_fin="2024-12-31",
+    estrategia_fn=lambda: SupportResistanceStrategy(),  # instancia nueva por activo
+    capital_inicial=10_000,
+    warmup="2y",
+)
+print(summary_table(results))   # tabla por activo
+```
+
+- Cada operación queda registrada con fecha/precio de entrada y salida, motivo
+  (`stop_loss` / `take_profit` / `señal_salida`) y % de resultado; una posición
+  abierta al final se marca como `open` (valuada al cierre del último día).
+- Activos sin datos suficientes se saltan sin romper la corrida.
+- La **prueba anti-look-ahead** corta el histórico en una fecha intermedia y
+  exige señales idénticas hasta esa fecha (ver `tests/test_walk_forward_multi.py`).
+
+```bash
+python examples\ejemplo_walk_forward.py   # 5 activos reales + anti-look-ahead + gráfico
+```
 
 ## Barrido multi-activo + reporte interactivo (UI)
 
